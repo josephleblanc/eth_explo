@@ -1,3 +1,3 @@
 /target
-/config/endpoint.txt
 /src/*.swp
+/.env
