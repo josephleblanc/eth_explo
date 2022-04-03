@@ -2,10 +2,10 @@
 //      Keeping track of trade:
 //          x Amount traded in
 //          x Amount traded out
-//          Uniswap pool ratio at time of exchange
+//          x Uniswap pool ratio at time of exchange
 //          x Sending address
 //          x Receiving address (if WETH, make sure it counts as a coin they own)
-//          Bool sending addr == receiving addr
+//          x Bool sending addr == receiving addr
 //          x Start token
 //          x End token
 //
@@ -34,7 +34,8 @@ use web3::types::{H160, BlockId, U64, H256};
 
 use eth_explo::{
     read_uniswap_tx,
-    u256_to_f64
+    u256_to_f64,
+    Trader
 };
 //    print_swapETHForExactTokens, // Leaving these here for testing
 //    print_swapExactTokensForETH, //
@@ -119,9 +120,9 @@ async fn main() -> web3::Result<()> {
     let web3 = web3::Web3::new(transport);
 
     // Set up trader tracking and uniswap tracking
-    let mut trader_kv: HashMap<H160, HashMap<H160, f64>> = HashMap::new();
-    let mut uniswap_pools: HashMap<(H160, H160), (f64, f64)> = HashMap::new();
-    let mut trader_hist_cost: HashMap<H160, f64> = HashMap::new();
+    // uniswap_pools is: coin address, ratio to weth
+    let mut uniswap_pools: HashMap<H160, f64> = HashMap::new();
+    let mut trader_map: HashMap<H160, Trader> = HashMap::new();
 
     // Time stuff
     let mut start_t = Instant::now();
@@ -132,6 +133,7 @@ async fn main() -> web3::Result<()> {
     let start_block = 14503000_u64;
     let end_block = 14503100_u64;
     let n_blocks = end_block - start_block;
+    
     for number in start_block..end_block {
         println!("Scanning block {}     of  {}", number - start_block, n_blocks);
         let block_number = BlockId::from(U64::from(number));
@@ -153,53 +155,36 @@ async fn main() -> web3::Result<()> {
 //                    println!("method_id: {}", method_id.as_str());
 //                    println!("{:?}", tx.hash);
                     if receipt.logs.last().is_some() {
-                    let (start_token, start_amount, end_token, end_amount, receiving_addr, pool_ratios) = 
-                        read_uniswap_tx(tx, 
+                    let extracted_uniswap = read_uniswap_tx(tx, 
                                         &receipt, 
                                         &fid_vec, 
                                         &eth_for_ids).unwrap();
+                    let (start_token, start_amount, end_token, end_amount, receiving_addr, pool_ratios) = extracted_uniswap;
 //                    println!(
 //"start_token:{:?}\nstart_amount:{:?}\nend_token:{:?}
 //end_amount:{:?}\nreceiving_addr:{:?}\npool_ratios:{:?}",
 //start_token, start_amount, end_token, end_amount, receiving_addr, pool_ratios
 //                    );
 //                    println!("send_addr == receiving_addr: {}", tx.from.unwrap() == receiving_addr);
-                    let from_addr = H160::from(tx.from.expect("Every tx should have this field").0);
+                    let mut trader = trader_map.entry(tx.from.unwrap())
+                        .or_insert(Trader::new());
                     let start_token = start_token.unwrap_or(weth_addr);
 //                    println!("start_token assigned to weth: {}", weth_addr);
 
-                    let trader_entry = trader_kv.entry(from_addr).or_insert(HashMap::new());
-                    *trader_entry.entry(start_token)
-                        .or_insert(-1.0 * start_amount) 
-                        -= start_amount;
-                    let gas_fee_f64 = u256_to_f64(receipt.gas_used
-                                        .expect("every successful transaction requires gas"));
-                    *trader_entry.entry(weth_addr)
-                        .or_insert(-1.0 * gas_fee_f64)
-                        -= gas_fee_f64;
-                    *trader_entry.entry(end_token.unwrap())
-                        .or_insert(end_amount)
-                        += end_amount;
-
-                    if tx.from == Some(debug_address) {
-                        println!("TRANSACTION\n{:?}", tx.from);
+                    if uniswap_pools.contains_key(&start_token) 
+                        || (start_token == weth_addr && uniswap_pools.contains_key(&end_token.unwrap())) {
+                        trader.holdings.entry(start_token)
+                            .and_modify(|cum_token_amt| *cum_token_amt =- start_amount)
+                            .or_insert(-1.0 * start_amount); 
+                        trader.holdings.entry(end_token.unwrap())
+                            .and_modify(|cum_token_amt| *cum_token_amt += end_amount)
+                            .or_insert(end_amount);
+                        trader.hist_cost += start_amount * uniswap_pools[&start_token];
+                        trader.cum_gas -= u256_to_f64(receipt.gas_used
+                            .expect("every successful transaction requires gas"));
+                        trader.cum_txs += 1_usize;
                     }
-
-                    for (coin_pair, value_pair) in pool_ratios { // try only saving weth tuples
-                        if coin_pair.0 == weth_addr || coin_pair.1 == weth_addr {
-                            uniswap_pools.insert(coin_pair, value_pair);
-//                            println!("Inserting to uniswap_pools: {:?}", (coin_pair, value_pair));
-
-                            let hist_val = match coin_pair.0 == weth_addr {
-                                true => (end_amount * value_pair.0 / value_pair.1) + gas_fee_f64,
-                                false => (end_amount * value_pair.1 / value_pair.0) + gas_fee_f64,
-                            };
-//                            println!("hist_val: {}", hist_val);
-                            *trader_hist_cost.entry(tx.from.expect("All valid transactions have a sender"))
-                                .or_insert(hist_val)
-                                += hist_val;
-                        }
-                    }
+                    update_pools(&mut uniswap_pools, &pool_ratios, &start_amount, &weth_addr);
 
                     } else {
 //                        println!("REVERTED: NO LOG DATA, PROBABLY REVERTED");
@@ -225,22 +210,14 @@ async fn main() -> web3::Result<()> {
     for entry in &uniswap_pools {
         println!("{:?}", entry);
     }
-    // Calculate the ratio of 
-    let uniswap_ratios: HashMap<&H160, f64> = uniswap_pools.iter()
-        .filter_map(|((coin0, coin1), (res0, res1))| match &weth_addr == coin0 {
-            true => Some((coin1, *res0 / *res1)),
-            false => match coin1 == &weth_addr {
-                true  => Some((coin0, *res1 / *res0)),
-                false => None,}})
-        .collect();
-//    for entry in &uniswap_ratios {
-//        println!("uniswap_ratios");
+//    for entry in &uniswap_pools {
+//        println!("uniswap_pools");
 //        println!("{:?}", entry);
 //    }
 
     let mut trader_profit_list: Vec<(&H160, f64)> = trader_kv.iter()
         .map(|(address, portfolio)| (address, portfolio.iter() 
-             .filter_map(|(coin, amt)| debug_print(coin).then(|| match uniswap_ratios.get(coin) {
+             .filter_map(|(coin, amt)| debug_print(coin).then(|| match uniswap_pools.get(coin) {
                          Some(ratio) => Some(amt * ratio),
                          None => None }).unwrap()) 
              .fold(0_f64, |acc, x| acc + x)))
@@ -270,4 +247,23 @@ fn debug_print<T: Debug>(to_print: T) -> bool {
     println!("DEBUG PRINT");
     println!("\t{:?}", to_print);
     true
+}
+
+pub fn update_pools(uniswap_pools: &mut HashMap<H160, f64>,
+                    pool_ratios: &Vec<((H160, H160), (f64, f64))>,
+                    start_amount: &f64,
+                    weth_addr: &H160) -> () {
+    for (coins, values) in pool_ratios { // try only saving weth tuples
+        let updated_pool = match coins.0 == *weth_addr {
+            true => Some((coins.0, start_amount * values.0 / values.1)),
+            false => match coins.1 == *weth_addr {
+                true => Some((coins.1, start_amount * values.1 / values.0)),
+                false => None,
+            }
+        };
+        match updated_pool {
+            Some((coin, ratio_weth)) => uniswap_pools.insert(coin, ratio_weth),
+            None => None,
+        };
+    }
 }

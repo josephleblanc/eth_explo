@@ -7,8 +7,39 @@ use web3::types::{
     Log,
 };
 
+use std::collections::HashMap;
+
 #[allow(dead_code)]
 #[allow(unused)]
+
+pub struct Trader {
+    pub address: H160,
+    pub total_assets: f64,
+    pub total_debt: f64,
+    pub cum_gas: f64,
+    pub cum_txs: usize,
+    pub profit_raw: f64,
+    pub hist_cost: f64,
+    pub holdings: HashMap<H160, f64>,
+}
+
+impl Trader {
+    pub fn new() -> Trader {
+
+        Trader {
+            address: H160::from_low_u64_be(0_u64),
+            total_assets: 0_f64,
+            total_debt: 0_f64,
+            cum_gas: 0_f64,
+            cum_txs: 0,
+            profit_raw: 0_f64,
+            hist_cost: 0_f64,
+            holdings: HashMap::new()
+        }
+    }
+}
+
+
 
 pub fn scrape_logs(logs: &Vec<Log>, fid_vec: &Vec<H256>, final_recipient: H256,
                    amount_out_min: U256)
