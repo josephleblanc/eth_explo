@@ -199,6 +199,7 @@ version = "0.1.0"
 dependencies = [
  "dotenv",
  "hex",
+ "serde_json",
  "tokio",
  "web3",
 ]

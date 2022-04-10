@@ -1,3 +1,6 @@
 /target
 /src/*.swp
+/src/main_backup.rs
 /.env
+/output
+.notes.txt

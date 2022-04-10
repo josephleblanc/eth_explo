@@ -23,31 +23,28 @@
 //          New pool ratio after each trade
 
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::thread;
-use std::time::{Instant, Duration};
-use std::env;
-
 use hex::FromHex;
 
-use web3::types::{H160, BlockId, U64, H256};
+use web3::types::{
+    H160,
+    H256, 
+};
 
 use eth_explo::{
     read_uniswap_tx,
     u256_to_f64,
-    Trader
+    Trader,
+    read_blocks,
+    read_receipt,
+    update_pools,
+    update_liq_pools,
+    Amm,
 };
-//    print_swapETHForExactTokens, // Leaving these here for testing
-//    print_swapExactTokensForETH, //
-//    print_swapExactTokensForTokens, //
-//    print_swapTokensForExactTokens, //
-//    print_swapExactTokensForETHSupportingFeeOnTransferTokens, //
-//    print_swapExactETHForTokensSupportingFeeOnTransferTokens, //
-//    };
 #[allow(non_snake_case)]
 
 #[tokio::main]
 async fn main() -> web3::Result<()> {
+    let debug = false;
     dotenv::dotenv().ok();
 
     // Set method ids for input functions, hash of first 8 hex digits in keccak hash
@@ -102,168 +99,199 @@ async fn main() -> web3::Result<()> {
         "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2").unwrap()
             .as_slice());
 
-    let debug_address = H160::from_slice(Vec::from_hex(
-        "34ed8d7b93485b454a57f856c54be08ade3c9132").unwrap()
-        .as_slice());
+//    let debug_addr: Option<H160> = None;
+    let mut is_debug_addr: bool;
+    let debug_addr: Option<H160>= Some(H160::from_slice(
+        &hex::decode(b"b7bb4454eb4ddca78c17b2911a0d0183984985b9").unwrap()));
 
-//    // Use this address for value at time of trade, calculated in WETH
-//    let hist_value_addr = H160::from_slice(Vec::from_hex(
-//            "0000000000000000000000000000000000000000").unwrap()
-//            .as_slice());
-
-    // Set up web3 endpoint
+    // Uniswap Address
     let uniswap_addr = H160::from_slice(
         &hex::decode(b"7a250d5630B4cF539739dF2C5dAcb4c659F2488D").unwrap());    
-    let transport = web3::transports::http::Http::new(
-        &env::var("ARCHIVE_NODE").unwrap())
-        .unwrap();
-    let web3 = web3::Web3::new(transport);
 
     // Set up trader tracking and uniswap tracking
     // uniswap_pools is: coin address, ratio to weth
+    // initialize weth ratio to self as 1.0
     let mut uniswap_pools: HashMap<H160, f64> = HashMap::new();
+    uniswap_pools.insert(weth_addr, 1.0_f64);
+    let mut uniswap_liq: HashMap<H160, (f64, f64)> = HashMap::new();
     let mut trader_map: HashMap<H160, Trader> = HashMap::new();
 
-    // Time stuff
-    let mut start_t = Instant::now();
-    let one_sec = Duration::from_millis(1_000);
-    let mut call_count = 0;
-
     // Block range
-    let start_block = 14503000_u64;
-    let end_block = 14503100_u64;
+    // Min saved is:
+    // Max saved is: 14518566
+    let start_block = 14508547_u64;
+    let end_block = 14510000_u64;
     let n_blocks = end_block - start_block;
-    
+
+    // Track trades captured and missed by ignoring coins with no Weth pairing
+    let mut captured_trade = 0;
+    let mut missed_trade = 0;
+    // Track shitcoin trades in which the uniswap pool would not have enough liquidity
+    // to support a similar trade a 'shitcoin_threshold' number of times
+    let mut shitcoin_trades = 0;
+    let shitcoin_threshold = 1.0_f64;
+    let mut shitcoin_list: Vec<H160> = vec![];
+
+    let print_terminal = false;
+
+    let mut receipts_missed = 0;
     for number in start_block..end_block {
-        println!("Scanning block {}     of  {}", number - start_block, n_blocks);
-        let block_number = BlockId::from(U64::from(number));
-        let block_txs = web3.eth().block_with_txs(block_number).await?
-            .unwrap()
-            .transactions;
-        call_count += 1;
-        println!("call_count: {}/10", call_count);
-        for tx in block_txs.iter() {
-            if tx.to.is_some() && tx.to.unwrap() == uniswap_addr { // test for last_log somewhere here
-                let method_id = hex::encode(&tx.input.0[0..4]);
-                if method_ids.contains(&method_id.as_str()) {
-                    // Find transactions with the uniswap router using the commands in method_ids
-                    // update trader hashmap
-                    // update uniswap hashmap
-                    let receipt = web3.eth().transaction_receipt(tx.hash).await?.unwrap();
-                    call_count += 1;
-//                    println!("call_count: {}/10", call_count);
-//                    println!("method_id: {}", method_id.as_str());
-//                    println!("{:?}", tx.hash);
-                    if receipt.logs.last().is_some() {
-                    let extracted_uniswap = read_uniswap_tx(tx, 
-                                        &receipt, 
-                                        &fid_vec, 
-                                        &eth_for_ids).unwrap();
-                    let (start_token, start_amount, end_token, end_amount, receiving_addr, pool_ratios) = extracted_uniswap;
-//                    println!(
-//"start_token:{:?}\nstart_amount:{:?}\nend_token:{:?}
-//end_amount:{:?}\nreceiving_addr:{:?}\npool_ratios:{:?}",
-//start_token, start_amount, end_token, end_amount, receiving_addr, pool_ratios
-//                    );
-//                    println!("send_addr == receiving_addr: {}", tx.from.unwrap() == receiving_addr);
-                    let mut trader = trader_map.entry(tx.from.unwrap())
-                        .or_insert(Trader::new());
-                    let start_token = start_token.unwrap_or(weth_addr);
-//                    println!("start_token assigned to weth: {}", weth_addr);
+        if print_terminal { println!("block {} of {}", number - start_block, n_blocks); }
+//        println!("Scanning block {}     of  {}", number - start_block, n_blocks);
+        let block_path = format!("../../testy/blocks/{}.json", number);
+        let batched_blocks = read_blocks(&block_path).unwrap();
 
-                    if uniswap_pools.contains_key(&start_token) 
-                        || (start_token == weth_addr && uniswap_pools.contains_key(&end_token.unwrap())) {
-                        trader.holdings.entry(start_token)
-                            .and_modify(|cum_token_amt| *cum_token_amt =- start_amount)
-                            .or_insert(-1.0 * start_amount); 
-                        trader.holdings.entry(end_token.unwrap())
-                            .and_modify(|cum_token_amt| *cum_token_amt += end_amount)
-                            .or_insert(end_amount);
-                        trader.hist_cost += start_amount * uniswap_pools[&start_token];
-                        trader.cum_gas -= u256_to_f64(receipt.gas_used
-                            .expect("every successful transaction requires gas"));
-                        trader.cum_txs += 1_usize;
-                    }
-                    update_pools(&mut uniswap_pools, &pool_ratios, &start_amount, &weth_addr);
+        'blocks: for tx in batched_blocks.transactions.iter()//.flat_map(|b| &b.transactions)
+            .filter(|tx| tx.to.is_some() && tx.to.unwrap() == uniswap_addr &&
+                    !tx.input.0.is_empty() &&
+                    method_ids.contains(&hex::encode(&tx.input.0[0..4]).as_str()))
+        {
+            if debug_addr.is_some() && debug_addr.unwrap() == tx.from.unwrap() {
+                is_debug_addr = true;
+                println!("BLOCK FOR DEBUG ADDRESS: {}", number);
+            } else { is_debug_addr = false; }
+            if debug { println!("OK TX: {:?}", tx.hash); }
+            let path_receipt = format!("../../testy/receipts/{}_{:?}.json", 
+                                       tx.block_number.unwrap(), tx.hash);
+            let receipt = read_receipt(path_receipt).ok();
+            if receipt.is_none() {
+                if is_debug_addr {println!("Missed for debug addr: {:?}", tx.hash);}
+                receipts_missed += 1;
+                continue
+            }
+            let receipt = receipt.unwrap();
 
-                    } else {
-//                        println!("REVERTED: NO LOG DATA, PROBABLY REVERTED");
+            if receipt.logs.last().is_some() {
+                if debug { println!("/tOK Receipt: {:?}", receipt.transaction_hash); }
+                let extracted_uniswap = read_uniswap_tx(&tx, 
+                                    &receipt, 
+                                    &fid_vec, 
+                                    &eth_for_ids,
+                                    debug_addr.as_ref()).unwrap();
+                let (start_token, start_amount, end_token, end_amount, 
+                     _receiving_addr, pool_ratios) = &extracted_uniswap;
+                let start_token = start_token.unwrap_or(weth_addr);
+
+                // detect shitcoins and don't include traders or trades which cannot
+                // be duplicated
+                for ((coin0, coin1), (res0, res1)) in pool_ratios {
+                    let is_shitcoin: bool = match (*coin0 == start_token,
+                                                   *coin1 == start_token,
+                                                   *coin0 == end_token.unwrap(),
+                                                   *coin1 == end_token.unwrap()) {
+                        (true,_,_,_) => *res0 < (shitcoin_threshold * start_amount),
+                        (_,true,_,_) => *res1 < (shitcoin_threshold * start_amount),
+                        (_,_,true,_) => *res0 < (shitcoin_threshold * end_amount),
+                        (_,_,_,true) => *res1 < (shitcoin_threshold * end_amount),
+                        _ => false
+                    };
+                    if is_shitcoin {
+                        if is_debug_addr { 
+                            println!("SHITCOIN DETECTED: {:?}", ((coin0, coin1), (res0, res1))); 
+                        }
+                        shitcoin_trades += 1;
+                        shitcoin_list.push(match *coin0 == weth_addr {
+                            true => *coin1,
+                            false => *coin0,
+                        });
+                        continue 'blocks 
                     }
+                    if is_debug_addr {println!("extracted_uniswap: {:?}", extracted_uniswap.clone());}
                 }
-//                println!("");
-            }
-            // Rate limiting
-            if call_count >= 9 {
-                println!("call_count = {}/10", call_count);
-                let time_passed = start_t.elapsed();
-                println!("TIME CHECK: time passed = {} millis", time_passed.as_millis());
-                if time_passed < one_sec {
-                    println!("NAP TIME: {:?}", one_sec - time_passed);
-                    thread::sleep(one_sec - time_passed);
+
+                let mut trader = trader_map.entry(tx.from.unwrap())
+                    .or_insert(Trader::new());
+                trader.address = receipt.from;
+
+                // only track coins which include a weth-coin pair
+                if uniswap_pools.contains_key(&start_token)
+                    || (uniswap_pools.contains_key(&start_token) 
+                        && uniswap_pools.contains_key(&end_token.unwrap()))
+                    || (start_token == weth_addr && uniswap_pools.contains_key(&end_token.unwrap())) {
+                    captured_trade += 1;
+                    trader.holdings.entry(start_token)
+                        .and_modify(|cum_token_amt| *cum_token_amt =- start_amount)
+                        .or_insert(-1.0 * start_amount); 
+                    trader.holdings.entry(end_token.unwrap())
+                        .and_modify(|cum_token_amt| *cum_token_amt += end_amount)
+                        .or_insert(*end_amount);
+                    trader.hist_cost += start_amount * uniswap_pools[&start_token];
+                    trader.cum_gas += u256_to_f64(receipt.gas_used
+                        .expect("every successful transaction requires gas"));
+                    trader.cum_txs += 1_usize;
+                } else {
+                    missed_trade += 1;
                 }
-                start_t = Instant::now();
-                call_count = 0;
-                println!("call_count: {}/10", call_count);
+                    update_pools(&mut uniswap_pools, &pool_ratios, &weth_addr);
+                    update_liq_pools(&mut uniswap_liq, &pool_ratios, &weth_addr);
             }
+//            }
+
         }
     }
     for entry in &uniswap_pools {
         println!("{:?}", entry);
     }
-//    for entry in &uniswap_pools {
-//        println!("uniswap_pools");
-//        println!("{:?}", entry);
-//    }
 
-    let mut trader_profit_list: Vec<(&H160, f64)> = trader_kv.iter()
-        .map(|(address, portfolio)| (address, portfolio.iter() 
-             .filter_map(|(coin, amt)| debug_print(coin).then(|| match uniswap_pools.get(coin) {
-                         Some(ratio) => Some(amt * ratio),
-                         None => None }).unwrap()) 
-             .fold(0_f64, |acc, x| acc + x)))
-        .collect::<Vec<(&H160, f64)>>();
-    trader_profit_list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-//    for entry in &trader_profit_list {
-//        println!("{:?}", entry);
-//    }
-
-    println!("RAW PROFIT");
-    let mut trader_profit_percent = trader_profit_list
-        .iter()
-        .filter(|(addr, _)| trader_hist_cost.contains_key(addr))
-        .map(|(addr, profit)| (addr, profit / trader_hist_cost[addr]))
-        .filter(|(_, percent)| percent.is_normal())
-        .collect::<Vec<(&&H160, f64)>>();
-    trader_profit_percent.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-    println!("\nPROFIT BY PERCENT");
-    for entry in trader_profit_percent {
+    for entry in &uniswap_liq {
         println!("{:?}", entry);
     }
+
+    let cloned_trader_map = trader_map.clone();
+    let trader_coin_totals = cloned_trader_map.iter()
+        .map(|(address, t)| (address, t.holdings.iter()
+            .map(|(coin, amt)| (coin, match uniswap_pools.get(coin) {
+                Some(ratio) => Some(amt * ratio),
+                None => None }))
+            .filter(|(_, amt)| (amt).is_some())
+            .map(|(coin, amt)| (coin, amt.unwrap()))
+            .collect::<Vec<(&H160, f64)>>()));
+
+    for (address, holdings) in trader_coin_totals {
+        if let Some(t) = trader_map.get_mut(&address) {
+            t.total_assets = holdings.iter()
+                .filter(|(_coin, amt)| amt > &0.0)
+                .map(|(_coin, amt)| amt)
+                .fold(0_f64, |acc, x| acc + x);
+            t.total_debt = holdings.iter()
+                .filter(|(_coin, amt)| amt < &0.0)
+                .map(|(_coin, amt)| amt)
+                .fold(0_f64, |acc, x| acc + x);
+            t.profit_raw = t.total_assets + t.total_debt;
+            t.profit_percent = -1.0 * t.total_assets / t.total_debt;
+            t.roi_percent = (t.profit_raw + t.hist_cost - t.cum_gas) / t.hist_cost;
+            t.real_gain_percent = (t.total_assets - t.cum_gas) / t.hist_cost;
+//            println!("address: {}", address);
+//            println!("\ttotal_assets: {}", t.total_assets);
+//            println!("\ttotal_debt: {}", t.total_debt);
+//            println!("\tprofit_percent: {}", t.profit_percent);
+//            println!("\troi_percent: {}", t.roi_percent);
+//            if t.profit_percent.is_nan() {
+//                println!("\tholdings: {:?}", t.holdings);
+//            }
+        }
+    }
+
+    let mut trader_profit_list: Vec<(&H160, f64, f64, usize, f64, f64)> = trader_map.iter()
+        .filter(|(_addr, t)| !t.roi_percent.is_nan())
+        .map(|(addr, t)| (addr, t.roi_percent, t.profit_percent, t.cum_txs, t.profit_raw, t.real_gain_percent))
+        .filter(|(_,_,_,cum_txs,_, _)| cum_txs > &10_usize)
+        .collect();
+    trader_profit_list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    for entry in &trader_profit_list {
+        println!("{:?}, {:.001}, {:.001}, {}, {}, {:.001}", entry.0, entry.1, entry.2, entry.3, entry.4, entry.5);
+        if entry.1 > 2.0 {
+            println!("\t{:?}", trader_map[entry.0].holdings);
+        }
+    }
+
+    println!("receipts_missed = {}", receipts_missed);
+    println!("trades captured: {}", captured_trade);
+    println!("missed:          {}", missed_trade);
+    println!("captured / total: {}", captured_trade as f64 / (captured_trade as f64 
+                                                              + missed_trade as f64));
+    println!("shitcoin_trades: {}", shitcoin_trades);
     Ok(())
 }
 
-fn debug_print<T: Debug>(to_print: T) -> bool {
-    println!("DEBUG PRINT");
-    println!("\t{:?}", to_print);
-    true
-}
-
-pub fn update_pools(uniswap_pools: &mut HashMap<H160, f64>,
-                    pool_ratios: &Vec<((H160, H160), (f64, f64))>,
-                    start_amount: &f64,
-                    weth_addr: &H160) -> () {
-    for (coins, values) in pool_ratios { // try only saving weth tuples
-        let updated_pool = match coins.0 == *weth_addr {
-            true => Some((coins.0, start_amount * values.0 / values.1)),
-            false => match coins.1 == *weth_addr {
-                true => Some((coins.1, start_amount * values.1 / values.0)),
-                false => None,
-            }
-        };
-        match updated_pool {
-            Some((coin, ratio_weth)) => uniswap_pools.insert(coin, ratio_weth),
-            None => None,
-        };
-    }
-}
