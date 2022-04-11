@@ -60,7 +60,9 @@ impl Trader {
 pub fn scrape_logs(logs: &Vec<Log>, fid_vec: &Vec<H256>, final_recipient: H256,
                    amount_out_min: U256,
                    debug_addr: Option<&H160>,
-                   start_addr: &H160
+                   start_addr: &H160,
+                   method: &str,
+                   method_ids: &[&str; 6],
                    )
 // Required outputs:
 // amount traded out, 
@@ -74,6 +76,7 @@ pub fn scrape_logs(logs: &Vec<Log>, fid_vec: &Vec<H256>, final_recipient: H256,
     if debug_addr.is_some() && debug_addr.unwrap() == start_addr {
         println!("Entering scrape_logs");
     }
+    let mut swap_count = 0;
     for log in logs {
 //        match debug_addr {
 //            Some(addr) => match addr == start_addr {
@@ -109,8 +112,15 @@ pub fn scrape_logs(logs: &Vec<Log>, fid_vec: &Vec<H256>, final_recipient: H256,
                 };
             }
             if start_amount.low_u32() == 0_u32 {
-                start_amount = std::cmp::max(data_vec[0], data_vec[1])
+                if method == method_ids[5] {
+                    if swap_count == 1 {
+                        start_amount = std::cmp::max(data_vec[0], data_vec[1]);
+                    }
+                } else {
+                    start_amount = std::cmp::max(data_vec[0], data_vec[1]);
+                }
             }
+            swap_count += 1;
             if debug_addr.is_some() && debug_addr.unwrap() == start_addr {
                 println!("SWAP:\n\tend_amount: {}", end_amount);
             }
@@ -149,7 +159,8 @@ pub fn scrape_logs(logs: &Vec<Log>, fid_vec: &Vec<H256>, final_recipient: H256,
 pub fn read_uniswap_tx(tx: &Transaction, receipt: &TransactionReceipt,
                                    fid_vec: &Vec<H256>, 
                                    short_input_funcs: &[&str],
-                                   debug_addr: Option<&H160>)
+                                   debug_addr: Option<&H160>,
+                                   method_ids: &[&str; 6])
 -> Option<(Option<H160>,   //start_token
     f64,           // start_amount
     Option<H160>, // end_token
@@ -211,7 +222,9 @@ pub fn read_uniswap_tx(tx: &Transaction, receipt: &TransactionReceipt,
     let (start_amount, end_amount, reserve_ratios) = 
         scrape_logs(&receipt.logs, fid_vec, final_recipient, amount_out_min,
                     debug_addr,
-                    &tx.from.unwrap());
+                    &tx.from.unwrap(),
+                    method.as_str(),
+                    method_ids);
     let pool_ratios = swap_addrs.into_iter()
         .zip(reserve_ratios)
         .collect::<Vec<((H160, H160), (f64, f64))>>();
@@ -340,42 +353,31 @@ pub fn update_liq_pools(uniswap_liq: &mut HashMap<H160, (f64, f64)>,
 pub struct Amm {
     token0_name: H160,
     token1_name: H160,
-    token0_amt: f64,
-    token1_amt: f64,
-    const_product: f64
+    token0_res: f64,
+    token1_res: f64,
 }
 
 impl Amm {
     pub fn new(token0_name: H160, token1_name: H160,
-               token0_amt: f64, token1_amt: f64,
-               const_product: f64) -> Amm {
+               token0_res: f64, token1_res: f64) -> Amm {
         Amm {
             token0_name,
             token1_name,
-            token0_amt,
-            token1_amt,
-            const_product,
+            token0_res,
+            token1_res,
         }
     }
-    pub fn swap(&mut self, token_in: H160, amt_in: f64) -> f64 {
-        let (res_in, res_out): (&mut f64, &mut f64) = match token_in == self.token0_name {
-            true => (&mut self.token0_amt, &mut self.token1_amt),
-            false => match token_in == self.token1_name {
-                true => (&mut self.token1_amt, &mut self.token0_amt),
-                false => panic!("invalid token input") }
-        };
-        *res_in += amt_in;
-        let amt_out = *res_out - (self.const_product / *res_in);
-        *res_out -= amt_out;
-        amt_out
-    }
-    pub fn immut_swap(&self, token_in: H160, amt_in: f64) -> f64 { 
+    pub fn uniswap_immut(&self, token_in: H160, amt_in: f64) -> f64 {
         let (res_in, res_out): (&f64, &f64) = match token_in == self.token0_name {
-            true => (&self.token0_amt, &self.token1_amt),
+            true => (&self.token0_res, &self.token1_res),
             false => match token_in == self.token1_name {
-                true => (&self.token1_amt, &self.token0_amt),
+                true => (&self.token1_res, &self.token0_res),
                 false => panic!("invalid token input") }
         };
-        *res_out - (self.const_product / (*res_in + amt_in))
+        let amount_in_with_fee = amt_in * 997.0;
+        let numerator = amount_in_with_fee * *res_out;
+        let denominator = (*res_in * 1000_f64) + amount_in_with_fee;
+        let amt_out = numerator / denominator;
+        amt_out
     }
 }
