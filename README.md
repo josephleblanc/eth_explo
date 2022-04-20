@@ -1,6 +1,4 @@
 # eth_explo
-Explores the ethereum blockchain
-
 The goal of the program is to provide metrics on trader profit and loss by using on-chain analysis.
 This is a tool to explore uniswap transactions by analyzing onchain data requested from an archive ethereum node api.
 This project assumes you already have the transactions and receipts filtered and downloaded to a local folder.
